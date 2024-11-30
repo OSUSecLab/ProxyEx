@@ -1,0 +1,955 @@
+#include "decompiler_imports.dl"
+#include "memory_modeling/memory_modeling.dl"
+//#include "../gigahorse-toolchain/clientlib/flows.dl"
+//#include "../gigahorse-toolchain/clientlib/dominators.dl"
+
+/**
+  Component that performs call-site-level inlining.
+  Can be extended with the InlineCandidate relation being overridable
+  enabling the creation of custom inline strategies.
+  A subset of InlineCandidate will be in FunctionToInline after making 
+  sure that our control-flow invariants will not break and that it doesn't 
+  contain calls to other inline candidate functions.
+*/
+
+.comp FunctionInliner{
+  /*Inputs and outputs following the parts of the client analysis schema
+   that are affected by inlining. */
+  .decl In_Statement_Opcode(stmt:Statement, opcode:Opcode)
+  .decl In_IsStatement(stmt:Statement)
+  .decl In_Statement_Block(stmt: Statement, block: Block)
+  .decl In_Variable_Value(var: Variable, value: Value)
+  .decl In_Variable_BlockValue(var: Variable, value: Value)
+  .decl In_LocalBlockEdge(block: Block, nextBlock: Block)
+  .decl In_FallthroughEdge(block: Block, nextBlock: Block)
+  .decl In_CallGraphEdge(block: Block, function: Function)
+  .decl In_FunctionCallReturn(block: Block, function: Function, return: Block)
+  .decl In_IsFunction(func: Function)
+  .decl In_Block_Gas(block:Block, gas:number)
+  .decl In_Block_CodeChunkAccessed(block:Block, chunk:Chunk)
+  .decl In_Statement_OriginalStatement(irstmt: Statement, stmt: symbol)
+  .decl In_Statement_OriginalStatementList(irstmt: Statement, stmtList: OriginalStatementList)
+  .decl In_OriginalStatement_Block(stmt:symbol, block:Block)
+  .decl In_FormalArgs(fn: Function, a: Variable, pos: number)
+  .decl In_Statement_Uses(stmt: Statement, var: Variable, i: number)
+  .decl In_Statement_Defines(stmt: Statement, var: Variable, n: number)
+  .decl In_Statement_Next(stmt: Statement, next: Statement)
+  .decl In_FunctionEntry(block: Block)
+  .decl In_InFunction(block: Block, function: Function)
+  .decl In_ActualReturnArgs(caller: Block, a: Variable, pos: number)
+
+  .decl Out_Statement_Opcode(stmt:Statement, opcode:Opcode)  //CHECK
+  .decl Out_IsStatement(stmt:Statement) //CHECK
+  .decl Out_Statement_Block(stmt: Statement, block: Block) //CHECK
+  .decl Out_Variable_Value(var: Variable, value: Value)
+  .decl Out_Variable_BlockValue(var: Variable, value: Value)
+  .decl Out_LocalBlockEdge(block: Block, nextBlock: Block)  //CHECK
+  .decl Out_FallthroughEdge(block: Block, nextBlock: Block)     //CHECK
+  .decl Out_CallGraphEdge(block: Block, function: Function)            //CHECK
+  .decl Out_FunctionCallReturn(block: Block, function: Function, return: Block)   //CHECK
+  .decl Out_IsFunction(func: Function)  //CHECK
+  .decl Out_Block_Gas(block:Block, gas:number)  //CHECK
+  .decl Out_Block_CodeChunkAccessed(block:Block, chunk:Chunk)  //CHECK
+  .decl Out_Statement_OriginalStatement(irstmt: Statement, stmt: symbol)
+  .decl Out_Statement_OriginalStatementList(irstmt: Statement, stmtList: OriginalStatementList)
+  .decl Out_OriginalStatement_Block(stmt:symbol, block:Block)
+  .decl Out_FormalArgs(fn: Function, a: Variable, pos: number) //CHECK
+  .decl Out_Statement_Uses(stmt: Statement, var: Variable, i: number)  //CHECK
+  .decl Out_Statement_Defines(stmt: Statement, var: Variable, n: number)  //CHECK
+  .decl Out_Statement_Next(stmt: Statement, next: Statement)  //CHECK
+  .decl Out_FunctionEntry(block: Block)  //CHECK
+  .decl Out_InFunction(block: Block, function: Function)  //CHECK
+  .decl Out_ActualReturnArgs(caller: Block, a: Variable, pos: number) //CHECK
+
+  /* Will be overriden to specify which functions the specific inliner will want to inline 
+     FunctionToInline will contain a subset of this */
+  .decl InlineCandidate(fun:Function) overridable
+  
+  /* Functions that will be inlined in this instatiation of the component */
+  .decl FunctionToInline(fun:Function)
+
+  .decl SafelyInlinableFunction(fun:Function)
+  .decl FunHasArgMismatch(fun:Function)
+  .decl FunHasRetMismatch(fun:Function)
+  .decl FunCalledWithImpreciseControlFlow(fun:Function)
+  .decl CGEToInlineCandidate(caller:Function, callee:Function)
+  .decl Function_Exit(fun:Function, block: Block)
+  .decl FunctionToInline_RetStmt(fun:Function, retStmt:Statement)
+  .decl ThrowBlock(block:Block)
+
+  /* Helper predicates associating In -> Out{Blocks,Stmts,Vars} */
+  /* For cloned ones the call-site(block) is used as context and for non cloned ones the empty string */
+  .decl InBlock_OutBlock(inBlock:Block, callBlock:Block, outBlock:Block)
+  .decl InStatement_OutStatement(inStmt:Statement, callBlock:Block, outStmt:Statement)
+  .decl InVar_OutVar(inVar:Variable, callBlock:Block, outVar:Variable)
+
+
+  .decl CallToClonedFunction(cloneBlock:Block, callStmt:Statement, fun:Function)
+  .decl ClonedCallArgs(cloneBlock:Block, callStmt:Statement, fun:Function, actualArg:Variable, formalArg:Variable)
+  .decl ClonedCallRets(cloneBlock:Block, callStmt:Statement, fun:Function, retStmt:Statement, actualRet:Variable, formalRet:Variable)
+
+  .decl BlockToClone(block:Block, fromFun:Function, callerBlock:Block, callerFun:Function, newBlock:Block)
+  .decl StatementToClone(stmt:Statement, fromFun:Function, callerBlock:Block, callerFun:Function, newStmt:Statement)
+  .decl VariableToClone(var:Variable, fromFun:Function, callerBlock:Block, callerFun:Function, newVar:Variable)
+  
+  /* By default tries to inline all private functions */
+  InlineCandidate(fun):-
+    In_IsFunction(fun),
+    !IsPublicFunction(fun).
+
+  /* at least one actual arg missing at some call-site */
+  FunHasArgMismatch(fun):-
+    In_CallGraphEdge(callerBlock, fun),
+    In_FormalArgs(fun, _, i),
+    In_Statement_Block(callStmt, callerBlock),
+    In_Statement_Opcode(callStmt, "CALLPRIVATE"),
+    !In_Statement_Uses(callStmt, _, i+1).
+  
+  /* Formal returns don't match with the number of returns inferred */  
+  FunHasRetMismatch(fun):-
+    In_CallGraphEdge(callerBlock, fun),
+    In_Statement_Block(callStmt, callerBlock),
+    In_Statement_Opcode(callStmt, "CALLPRIVATE"),
+    In_Statement_Defines(callStmt, _, i),
+    Function_Exit(fun, retBlock),
+    In_Statement_Block(retStmt, retBlock),
+    In_Statement_Opcode(retStmt, "RETURNPRIVATE"),
+    !In_Statement_Uses(retStmt, _, i + 1).
+
+  /* Case based on an example: when such imprecision exists don't inline */
+  FunCalledWithImpreciseControlFlow(fun):-
+    In_CallGraphEdge(callerBlock, fun),
+    In_LocalBlockEdge(callerBlock, next1),
+    In_LocalBlockEdge(callerBlock, next2),
+    next1 != next2.
+
+  /*
+    Restriction ensures that the inlined functions have either a single return
+    or no actual returned variables. Otherwise we'd need to add PHIs.
+  */
+  .decl FunctionReturnRestriction(fun:Function)
+  
+  FunctionReturnRestriction(fun):-
+    In_IsFunction(fun),
+    1 = count: Function_Exit(fun, _).
+
+  FunctionReturnRestriction(fun):-
+    In_IsFunction(fun),
+    1 < count: Function_Exit(fun, _),
+    !In_FormalReturnArgs(fun, _, 0).
+
+  /* We can safely inline functions with only one return
+     and matching args and returns at every call-site(as described above) */
+  SafelyInlinableFunction(fun):-
+    In_IsFunction(fun),
+    !IsPublicFunction(fun),
+    fun != "0x0", // SL: Hack because the function selector is not part of IsPublicFunction
+    FunctionReturnRestriction(fun),
+    !FunHasArgMismatch(fun),
+    !FunHasRetMismatch(fun),
+    !FunCalledWithImpreciseControlFlow(fun).
+
+  ThrowBlock(block):-
+    (In_Statement_Opcode(throw, "THROW"); In_Statement_Opcode(throw, "REVERT")),
+    In_Statement_Block(throw, block).
+
+  Function_Exit(fun, block) :-
+    In_InFunction(block, fun),
+    (In_LocalBlockEdge(_, block);
+     In_FunctionEntry(block)),
+    !ThrowBlock(block),
+    !In_LocalBlockEdge(block, _).
+
+  CGEToInlineCandidate(caller, callee):-
+    InlineCandidate(callee),
+    SafelyInlinableFunction(callee),
+    In_CallGraphEdge(callerBlock, callee),
+    In_InFunction(callerBlock, caller).
+
+  /* The functions that end up being inlined are the safely inlinable candidates
+     that do not contain calls to other inline candidates */
+  FunctionToInline(func):-
+    InlineCandidate(func),
+    SafelyInlinableFunction(func),
+    In_IsFunction(func),
+    !IsPublicFunction(func),
+    !CGEToInlineCandidate(func, _).
+
+  /*
+    Derived fact relations needed to be used by the subcomponents
+  */
+
+  .decl In_Statement_Function(s: Statement, f: Function)
+  .decl In_ActualArgs(caller: Block, a: Variable, pos: number)
+  .decl In_FormalReturnArgs(fn: Function, a: Variable, pos: number)
+
+
+  In_Statement_Function(s, f) :-
+    In_Statement_Block(s, b),
+    In_InFunction(b, f).
+
+  In_ActualArgs(caller, a, pos - 1) :-
+    In_Statement_Uses(s, a, pos),
+    In_Statement_Opcode(s, "CALLPRIVATE"),
+    pos >= 1,
+    In_Statement_Block(s, caller).
+
+  In_FormalReturnArgs(fn, a, pos - 1) :-
+    In_Statement_Uses(s, a, pos),
+    In_Statement_Opcode(s, "RETURNPRIVATE"),
+    pos >= 1,
+    In_Statement_Block(s, b),
+    In_InFunction(b, fn).
+  
+  /* Identifying the blocks and statements to be cloned is trivial after finding FunctionToInline */
+  InBlock_OutBlock(block, callerBlock, newBlock),
+  BlockToClone(block, calleeFun, callerBlock, callerFun, newBlock):-
+    FunctionToInline(calleeFun),
+    In_CallGraphEdge(callerBlock, calleeFun),
+    In_ValidBlock(callerBlock),
+    In_InFunction(callerBlock, callerFun),
+    In_InFunction(block, calleeFun),
+    newBlock = cat(cat(block, "B"), callerBlock).
+  
+  InBlock_OutBlock(block, "", block):-
+    In_InFunction(block, _),
+    In_ValidBlock(block),
+    !BlockToClone(block, _, _, _, _).
+
+  InStatement_OutStatement(stmt, callerBlock, newStmt),
+  StatementToClone(stmt, func, callerBlock, callerFun, newStmt):-
+    BlockToClone(block, func, callerBlock, callerFun, _),
+    In_Statement_Block(stmt, block),
+    newStmt = cat(cat(stmt, ""), callerBlock).
+
+  InStatement_OutStatement(stmt, "", stmt):-
+    In_Statement_Block(stmt, _),
+    !StatementToClone(stmt, _, _, _, _).
+
+  Out_Statement_Block(stmt, block):-
+    In_Statement_Block(stmt, block),
+    !BlockToClone(block, _, _, _, _).
+
+  Out_Statement_Block(newStmt, newBlock):-
+    In_Statement_Block(stmt, block),
+    BlockToClone(block, _, callerBlock, _, newBlock),
+    StatementToClone(stmt, _, callerBlock, _, newStmt).
+
+  
+  Out_InFunction(block, function):-
+    In_InFunction(block, function),
+    !BlockToClone(block, _, _, _, _).
+  
+  Out_InFunction(newBlock, callerFun):-
+    BlockToClone(block, inlinedFun, _, callerFun, newBlock),
+    In_InFunction(block, inlinedFun).
+  
+  Out_FunctionEntry(block):-
+    In_FunctionEntry(block),
+    !BlockToClone(block, _, _, _, _).
+
+  Out_FormalArgs(fun, a, pos):-
+    In_FormalArgs(fun, a, pos),
+    !FunctionToInline(fun).
+  
+  Out_IsFunction(fun):-
+    In_IsFunction(fun),
+    !FunctionToInline(fun).
+
+  Out_CallGraphEdge(outBlock, fun):-
+    In_CallGraphEdge(inBlock, fun),
+    InBlock_OutBlock(inBlock, _, outBlock),
+    !FunctionToInline(fun).
+
+  Out_FunctionCallReturn(outBlock, fun, outReturn):-
+    In_FunctionCallReturn(inBlock, fun, inReturn),
+    InBlock_OutBlock(inBlock, same, outBlock),
+    InBlock_OutBlock(inReturn, same, outReturn),
+    !FunctionToInline(fun).
+  
+  Out_Block_Gas(outBlock, gas):-
+    In_Block_Gas(inBlock, gas),
+    InBlock_OutBlock(inBlock, _, outBlock).
+
+  Out_Block_CodeChunkAccessed(outBlock, chunk):-
+    In_Block_CodeChunkAccessed(inBlock, chunk),
+    InBlock_OutBlock(inBlock, _, outBlock).
+
+  Out_Statement_OriginalStatement(outStmt, stmt):-
+    In_Statement_OriginalStatement(inStmt, stmt),
+    InStatement_OutStatement(inStmt, _, outStmt).
+
+  Out_Statement_OriginalStatementList(outStmt, stmtList):-
+    In_Statement_OriginalStatementList(inStmt, stmtList),
+    InStatement_OutStatement(inStmt, "", outStmt).
+
+  Out_Statement_OriginalStatementList(outStmt, [originalCall, stmtList]):-
+    In_Statement_OriginalStatementList(inStmt, stmtList),
+    StatementToClone(inStmt, _, callerBlock, _, outStmt),
+    In_Statement_Block(callStmt, callerBlock),
+    In_Statement_Opcode(callStmt, "CALLPRIVATE"),
+    In_Statement_OriginalStatement(callStmt, originalCall).
+
+  Out_OriginalStatement_Block(stmt, outBlock):-
+    In_OriginalStatement_Block(stmt, inBlock),
+    InBlock_OutBlock(inBlock, _, outBlock).
+
+  Out_FallthroughEdge(outFrom, outTo):-
+    In_FallthroughEdge(inFrom, inTo),
+    InBlock_OutBlock(inFrom, same, outFrom),
+    InBlock_OutBlock(inTo, same, outTo).
+
+  .decl In_ValidBlock(block:Block)
+  //Hack because the decompiler sometimes gives 'dead' blocks
+  In_ValidBlock(block):-
+    In_LocalBlockEdge(block, _);
+    In_LocalBlockEdge(_, block);
+    In_Statement_Block(_, block).
+
+  Out_LocalBlockEdge(outFrom, outTo):-
+    In_LocalBlockEdge(inFrom, inTo),
+    InBlock_OutBlock(inFrom, same, outFrom),
+    InBlock_OutBlock(inTo, same, outTo),
+    !BlockToClone(_, _, inFrom, _, _).  // Disregard old LocalBlockEdges from blocks/call-sites to inlined functions.
+  
+  Out_LocalBlockEdge(outFrom, outTo):-
+    FunctionToInline(fun),
+    In_FunctionCallReturn(inFrom, fun, _),
+    In_ValidBlock(inFrom),
+    In_InFunction(inEntry, fun),
+    In_FunctionEntry(inEntry),
+    InBlock_OutBlock(inFrom, "", outFrom),
+    InBlock_OutBlock(inEntry, inFrom, outTo).
+
+  Out_LocalBlockEdge(outExitBlock, outRet):-
+    FunctionToInline(fun),
+    In_FunctionCallReturn(inFrom, fun, inRet),
+    In_ValidBlock(inFrom),
+    Function_Exit(fun, exitBlock),
+    InBlock_OutBlock(inRet, "", outRet),
+    InBlock_OutBlock(exitBlock, inFrom, outExitBlock).
+
+
+  Out_Statement_Next(outStmt, outNext):-
+    In_Statement_Next(inStmt, inNext),
+    InStatement_OutStatement(inStmt, same, outStmt),
+    InStatement_OutStatement(inNext, same, outNext),
+    !ClonedCallArgs(_, inStmt, _, _, _).
+
+  
+  /* old next of the call in a cloned call-site is the new next of the return */
+  Out_Statement_Next(clonedRet, outNext):-
+    ClonedCallRets(callerBlock, callStmt, _, retStmt, _, _),
+    In_Statement_Next(callStmt, inNext),
+    InStatement_OutStatement(retStmt, callerBlock, clonedRet),
+    InStatement_OutStatement(inNext, "", outNext).
+  
+  /* next of the call in a cloned call-site is the first statement
+     of the entry block of the cloned function */
+  Out_Statement_Next(outCall, outFirstStmt):-
+    ClonedCallArgs(callerBlock, callStmt, callee, _, _),
+    In_InFunction(inEntryBlock, callee),
+    In_FunctionEntry(inEntryBlock),
+    In_Statement_Block(inFirstStmt, inEntryBlock),
+    !In_Statement_Next(_, inFirstStmt),
+    InStatement_OutStatement(callStmt, "", outCall),
+    InStatement_OutStatement(inFirstStmt, callerBlock, outFirstStmt).
+  
+  /* Keep old opcodes in all but inlined calls/returns */
+  Out_Statement_Opcode(outStmt, opcode):-
+    In_Statement_Opcode(inStmt, opcode),
+    InStatement_OutStatement(inStmt, _, outStmt),
+    !CallToClonedFunction(_, inStmt, _),
+    !FunctionToInline_RetStmt(_, inStmt).
+
+  Out_Statement_Opcode(outStmt, "JUMP"):-
+    InStatement_OutStatement(inStmt, _, outStmt),
+    (CallToClonedFunction(_, inStmt, _); FunctionToInline_RetStmt(_, inStmt)).
+
+  Out_IsStatement(outStmt):-
+    InStatement_OutStatement(_, _, outStmt).
+
+  CallToClonedFunction(callerBlock, callStmt, callee):-
+    FunctionToInline(callee),
+    In_CallGraphEdge(callerBlock, callee),
+    In_Statement_Block(callStmt, callerBlock),
+    In_Statement_Opcode(callStmt, "CALLPRIVATE").
+
+  /* Helper predicate identifying call stmts actual-formal args for cloned calls */
+  ClonedCallArgs(callerBlock, callStmt, callee, actualArg, formalArg):-
+    CallToClonedFunction(callerBlock, callStmt, callee),
+    In_Statement_Uses(callStmt, actualArg, i),
+    i > 0,
+    In_FormalArgs(callee, formalArg, i-1).
+
+  FunctionToInline_RetStmt(callee, retStmt):-
+    FunctionToInline(callee),
+    Function_Exit(callee, retBlock),
+    In_Statement_Block(retStmt, retBlock),
+    In_Statement_Opcode(retStmt, "RETURNPRIVATE").
+
+  /* Helper predicate identifying call and return stmts actual-formal rets for cloned calls */
+  ClonedCallRets(callerBlock, callStmt, callee, retStmt, actualRet, formalRet):-
+    CallToClonedFunction(callerBlock, callStmt, callee),
+    In_Statement_Defines(callStmt, actualRet, i),
+    FunctionToInline_RetStmt(callee, retStmt),
+    In_Statement_Uses(retStmt, formalRet, i + 1).
+
+
+
+  Out_Statement_Defines(outStmt, outVar, i),
+  InVar_OutVar(inVar, callerBlock, outVar),
+  VariableToClone(inVar, fromFun, callerBlock, callerFun, outVar):-
+    StatementToClone(inStmt, fromFun, callerBlock, callerFun, outStmt),
+    In_Statement_Defines(inStmt, inVar, i),
+    outVar = cat(cat(inVar, "V"), callerBlock).
+
+  Out_Statement_Defines(inStmt, inVar, i),
+  InVar_OutVar(inVar, "", inVar):-
+    In_Statement_Defines(inStmt, inVar, i),
+    !StatementToClone(inStmt, _, _, _, _),
+    !ClonedCallRets(_, inStmt, _, _, _, _).
+
+
+  InVar_OutVar(formalArg, "", formalArg):-
+    In_IsFunction(fun),
+    In_FormalArgs(fun, formalArg, _),
+    !FunctionToInline(fun).
+
+  InVar_OutVar(formalArg, callerBlock, actualArgExt):-
+    ClonedCallArgs(callerBlock, _, _, actualArg, formalArg),
+    InVar_OutVar(actualArg, "", actualArgExt).
+
+  InVar_OutVar(actualRet , "", formalRett):-
+    ClonedCallRets(callerBlock, _, _, _, actualRet, formalRet),
+    InVar_OutVar(formalRet, callerBlock, formalRett),
+    !ClonedCallArgs(_, _, _, _, formalRet).
+
+  InVar_OutVar(actualRet , "", actualArgg):-
+    ClonedCallRets(caller, _, _, _, actualRet, formalRet),
+    ClonedCallArgs(caller, _, _, actualArg, formalRet), //Formal ret is formal arg
+    InVar_OutVar(actualArg, "", actualArgg).
+
+  Out_Statement_Uses(outStmt, outVar, i):-
+    In_Statement_Uses(inStmt, inVar, i),
+    InStatement_OutStatement(inStmt, same, outStmt),
+    InVar_OutVar(inVar, same, outVar),
+    !ClonedCallRets(_, _, _, _, inVar, _),
+    !ClonedCallRets(_, inStmt, _, _, _, _),
+    !ClonedCallRets(_, _, _, inStmt, _, _).
+
+  Out_Statement_Uses(outStmt, outVar, i):-
+    In_Statement_Uses(inStmt, actualRet, i),
+    InStatement_OutStatement(inStmt, "", outStmt),
+    ClonedCallRets(callerBlock, _, _, _, actualRet, formalRet),
+    InVar_OutVar(formalRet, callerBlock, outVar),
+    !ClonedCallRets(_, inStmt, _, _, _, _).
+
+
+  /* Fixing the uses of cloned calls/returns to restore the JUMP stmts */
+  Out_Statement_Uses(outCall, outJumpTargetVar, 0):-
+    ClonedCallRets(_, inCall, _, _, _, _),
+    In_Statement_Uses(inCall, jumpTargetVar, 0),
+    InStatement_OutStatement(inCall, "", outCall),
+    InVar_OutVar(jumpTargetVar, "", outJumpTargetVar).
+
+  Out_Statement_Uses(outRetJump, outJumpTargetVar, 0):-
+    ClonedCallRets(callerBlock, _, _, retJump, _, _),
+    In_Statement_Uses(retJump, jumpTargetVar, 0),
+    InStatement_OutStatement(retJump, callerBlock, outRetJump),
+    InVar_OutVar(jumpTargetVar, callerBlock, outJumpTargetVar).
+  
+  Out_Variable_BlockValue(outVar, outVal):-
+    In_Variable_BlockValue(inVar, inVal),
+    In_Statement_Uses(inJump, inVar, 0),
+    In_Statement_Opcode(inJump, opcode),
+    (opcode = "JUMP" ; opcode = "JUMPI"),
+    InVar_OutVar(inVar, callerBlock, outVar),
+    callerBlock != "",
+    outVal = cat(cat(inVal, "B"), callerBlock).
+  
+  Out_Variable_BlockValue(outVar, inVal):-
+    In_Variable_BlockValue(inVar, inVal),
+    In_Statement_Uses(inJump, inVar, 0),
+    In_Statement_Opcode(inJump, opcode),
+    (opcode = "JUMP" ; opcode = "JUMPI"),
+    InVar_OutVar(inVar, "", outVar).
+ 
+
+  /* Will not be correct in Jumps to cloned blocks but does not matter
+     (it is not correct for cloned blocks in the decompiler outputs anyway) */
+  Out_Variable_Value(outVar, val):-
+    In_Variable_Value(inVar, val),
+    InVar_OutVar(inVar, _, outVar).
+
+  Out_ActualReturnArgs(outCaller, outVar, pos):-
+    In_ActualReturnArgs(caller, inVar, pos),
+    In_CallGraphEdge(caller, calleeFun),
+    !FunctionToInline(calleeFun),
+    InBlock_OutBlock(caller, same, outCaller),
+    InVar_OutVar(inVar, same, outVar).
+
+  
+  // Mia add begin
+  .decl DELEGATECALLOp(stmt:Statement, gas:Variable, target:Variable, data_start:Variable,
+           data_length:Variable, return_start:Variable, return_length:Variable, success:Variable)
+  .output DELEGATECALLOp
+  DELEGATECALLOp(stmt, gas, target, data_start, data_length, return_start, return_length, success) :-
+    Statement_Opcode(stmt, "DELEGATECALL"),
+    Statement_Defines(stmt, success, _),
+    Statement_Uses(stmt, gas, 0),
+    Statement_Uses(stmt, target, 1),
+    Statement_Uses(stmt, data_start, 2),
+    Statement_Uses(stmt, data_length, 3),
+    Statement_Uses(stmt, return_start, 4),
+    Statement_Uses(stmt, return_length, 5).
+
+  .decl SLOADOp(stmt: Statement, sloadPos: Variable, sloadVal: Variable)
+  // .output SLOADOp
+  SLOADOp(stmt, sloadPos, sloadVal) :-
+    Statement_Opcode(stmt,"SLOAD"),
+    Statement_Defines(stmt, sloadVal, _),
+    Statement_Uses(stmt, sloadPos, 0).
+
+  .decl SSTOREOp(stmt: Statement, index: Variable, var: Variable)
+  SSTOREOp(stmt, index, var) :-
+    Statement_Opcode(stmt,"SSTORE"),
+    Statement_Uses(stmt, index, 0),
+    Statement_Uses(stmt, var, 1).
+
+  .decl JUMPIOp(stmt:Statement, dest:Variable, condVar:Variable)
+  // .output JUMPIOp
+  JUMPIOp(stmt, dest, condVar) :-
+    Statement_Opcode(stmt, "JUMPI"),
+    Statement_Uses(stmt, dest, 0),
+    Statement_Uses(stmt, condVar, 1).
+
+  .decl RETURNDATASIZEOp(s: Statement, f: Variable)
+  // .output RETURNDATASIZEOp
+  RETURNDATASIZEOp(stmt, f) :-
+    Statement_Opcode(stmt, "RETURNDATASIZE"),
+    Statement_Defines(stmt, f, _).
+
+  .decl RETURNDATACOPYOp(s: Statement, a: Variable, b: Variable, c: Variable)
+  // .output RETURNDATACOPYOp
+  RETURNDATACOPYOp(stmt, a, b, c) :-
+    Statement_Opcode(stmt, "RETURNDATACOPY"),
+    Statement_Uses(stmt, a, 0),
+    Statement_Uses(stmt, b, 1),
+    Statement_Uses(stmt, c, 2).
+
+  .decl CALLDATACOPYOp(s: Statement, mem_start: Variable, calldata_start: Variable, length: Variable)
+  // .output CALLDATACOPYOp
+  CALLDATACOPYOp(stmt, mem_start, calldata_start, length) :-
+    Statement_Opcode(stmt, "CALLDATACOPY"),
+    Statement_Uses(stmt, mem_start, 0),
+    Statement_Uses(stmt, calldata_start, 1),
+    Statement_Uses(stmt, length, 2).
+
+  .decl MLOADOp(stmt: Statement, index: Variable)
+  // .output MLOADOp
+  MLOADOp(stmt, index) :-
+    Statement_Opcode(stmt,"MLOAD"),
+    Statement_Uses(stmt, index, 0).
+
+  .decl ADDOp(stmt: Statement, var1: Variable, var2: Variable)
+  // .output ADDOp
+  ADDOp(stmt, var1, var2) :-
+    Statement_Opcode(stmt,"ADD"),
+    Statement_Uses(stmt, var1, 0),
+    Statement_Uses(stmt, var2, 1).
+
+  .decl RETURNOp(stmt:Statement, start: Variable, length: Variable)
+  // .output RETURNOp
+  RETURNOp(stmt, start, length) :-
+    Statement_Opcode(stmt, "RETURN"),
+    Statement_Uses(stmt, start, 0),
+    Statement_Uses(stmt, length, 1).
+
+  .decl REVERTOp(stmt:Statement, memStart:Variable, memLength:Variable)
+  // .output REVERTOp
+  REVERTOp(stmt, memStart, memLength) :-
+    Statement_Opcode(stmt, "REVERT"),
+    Statement_Uses(stmt, memStart, 0),
+    Statement_Uses(stmt, memLength, 1).
+
+  .decl CALLDATASIZEOp(s: Statement, f: Variable)
+  // .output CALLDATASIZEOp
+  CALLDATASIZEOp(stmt, f) :-
+    Statement_Opcode(stmt, "CALLDATASIZE"),
+    Statement_Defines(stmt, f, _).
+
+  .decl depends(x:Variable, y:Variable)
+  depends(x, x) :-
+    Statement_Uses(_, x, _).
+
+  depends(x, x) :-
+    Statement_Defines(_, x, _).
+
+  depends(x, y) :-
+    Statement_Defines(stmt, x, _),
+    Statement_Uses(stmt, y, _).
+
+  depends(x, z) :-
+    depends(x, y),
+    depends(y, z).
+
+
+  .decl StmtEqual(var1: Variable, var2: Variable)
+  .output StmtEqual
+  StmtEqual(var1, var2) :-
+    Variable_Value(var1, var1Val),
+    Variable_Value(var2, var2Val),
+    var1Val = var2Val;
+    Statement_Defines(var1Stmt, var1, 0),
+    Statement_Opcode(var1Stmt, var1Op),
+    var1Op != "CONST",
+    Statement_Defines(var2Stmt, var2, 0),
+    Statement_Opcode(var2Stmt, var2Op),
+    var1Op = var2Op,
+    // continue with parameter 0, if any?
+    (Statement_Uses(var1Stmt, var1Para0, 0),
+    Statement_Uses(var2Stmt, var2Para0, 0),
+    StmtEqual(var1Para0, var2Para0);
+    !Statement_Uses(var1Stmt, _, 0),
+    !Statement_Uses(var2Stmt, _, 0)),
+    // continue with parameter 1, if any?
+    (Statement_Uses(var1Stmt, var1Para1, 1),
+    Statement_Uses(var2Stmt, var2Para1, 1),
+    StmtEqual(var1Para1, var2Para1);
+    !Statement_Uses(var1Stmt, _, 1),
+    !Statement_Uses(var2Stmt, _, 1)).
+
+
+  // rule 1: a delegatecall in the fallback()
+  .decl Rule1(func: Function, funcName: symbol, callStmt: Statement, callee: Variable, inOffset: Variable, inSize: Variable, retSize: Variable, suc: Variable)
+  .output Rule1
+  Rule1(func, funcName, callStmt, callee, inOffset, inSize, retSize, suc) :-
+    DELEGATECALLOp(callStmt, _, callee, inOffset, inSize, _, retSize, suc),
+    In_Statement_Function(callStmt, func),
+    HighLevelFunctionName(func, funcName),
+    (funcName = "()"; funcName = "fallback()"; funcName = "__function_selector__").
+
+  
+  // rule2: callee must come from a SLOAD; and trace SLOAD's related SSTORE 
+  .decl Rule2(calleeVar: Variable, funcName: symbol) 
+  .output Rule2
+  Rule2(calleeVar, funcName) :-
+    SLOADOp(_, sloadPosVar, _), 
+    depends(calleeVar, sloadPosVar),
+    SSTOREOp(sstoreStmt, sstorePoSVar, _),
+    
+    // fix index 3
+    // check all the layers of SLOAD and SSTORE
+    StmtEqual(sloadPosVar, sstorePoSVar),
+    
+    // get the setter function 
+    In_Statement_Function(sstoreStmt, sstoreFunc),
+    HighLevelFunctionName(sstoreFunc, funcName),
+    funcName != "()", funcName != "fallback()", funcName != "__function_selector__".
+
+  // extra rule2: if the calleeVar is from another contract returned function -> MLOAD 
+  // this is not upgradable proxy, since we cannot determine the setter function
+  .decl Rule22(calleeVar: Variable, funcName: symbol)
+  .output Rule22 
+  Rule22(calleeVar, funcName) :-
+    Statement_Defines(calleeStmt, calleeVar, 0),
+    (Statement_Opcode(calleeStmt, "MLOAD"); Statement_Opcode(calleeStmt, "CALLPRIVATE")),
+    In_Statement_Function(calleeStmt, calleeFunc),
+    HighLevelFunctionName(calleeFunc, funcName).
+
+
+  .decl Rule3(cdcStmt: Statement, inOffsetVar: Variable, inSizeVar: Variable, func: Function)
+  .output Rule3
+  Rule3(cdcStmt, inOffsetVar, inSizeVar, func) :- 
+    // Step 1: get the CALLDATACOPY opcode 
+    CALLDATACOPYOp(cdcStmt, memOffsetVar, _, memLengthVar),
+
+    // Step 2: CALLDATACOPY within the same function as the one contains DELEGATECALL
+    In_Statement_Function(cdcStmt, func),
+
+    // Step 4: CALLDATACOPY and DELEGATECALL memory size should be the same --- CALLDATASIZE/MLOAD(MLOAD(0x40))
+    // Step 4.1: CALLDATACOPY is the calldatasize or mload(xxx)
+    (CALLDATASIZEOp(_, cdsVar1), 
+    depends(memLengthVar, cdsVar1);
+    Statement_Defines(memLengthStmt, memLengthVar, _),
+    Statement_Opcode(memLengthStmt, "MLOAD")),
+    // Step 4.2: DELEGATECALL is the calldatasize or mload(xxx)
+    (CALLDATASIZEOp(_, cdsVar2), 
+    depends(inSizeVar, cdsVar2);
+    Statement_Defines(inSizeStmt, inSizeVar, _),
+    Statement_Opcode(inSizeStmt, "MLOAD")),
+
+    // Step 3.1: CALLDATACOPY and DELEGATECALL memory offset should be the same --- constant, usually 0
+    (Variable_Value(memOffsetVar, memOffsetVal),
+    Variable_Value(inOffsetVar, memOffsetVal); 
+
+    // Step 3.2: CALLDATACOPY and DELEGATECALL memory offset should be the same --- mload, usually 0x40
+    // Step 3.2.1: get calldatacopy's memory offset mload position
+    Statement_Defines(memOffsetStmt, memOffsetVar, _),
+    Statement_Opcode(memOffsetStmt, "MLOAD"),
+    MLOADOp(memOffsetStmt, cdcVar),
+    Variable_Value(cdcVar, bothVal), 
+    // Step 3.2.2: get delegatecall's memory offset mload position and should be the same
+    Statement_Defines(inOffsetStmt, inOffsetVar, _),
+    Statement_Opcode(inOffsetStmt, "MLOAD"),
+    MLOADOp(inOffsetStmt, dcVar),
+    Variable_Value(dcVar, bothVal);
+
+    // Step 3.3: CALLDATACOPY and DELEGATECALL memory offset should be the same --- add(mload(0x40), 0x20) 
+    // Step 3.2.1: get calldatacopy's memory offset add(mload(0x40), 0x20)  
+    Statement_Defines(memOffsetStmt, memOffsetVar, _),
+    Statement_Opcode(memOffsetStmt, "ADD"),
+    (ADDOp(memOffsetStmt, mload, Var201); ADDOp(memOffsetStmt, Var201, mload)),
+    Variable_Value(Var201, "0x20"),
+    Statement_Defines(mloadStmt, mload, _),
+    Statement_Opcode(mloadStmt, "MLOAD"),
+    MLOADOp(mloadStmt, Var401),
+    Variable_Value(Var401, "0x40"),
+    // Step 3.2.2: get delegatecall's memory offset add(mload(0x40), 0x20)  
+    Statement_Defines(inOffsetStmt, inOffsetVar, _), // inOffsetStmt = 0x37a	dcMload = 0xc9
+    Statement_Opcode(inOffsetStmt, "ADD"),
+    (ADDOp(inOffsetStmt, dcMload, Var202); ADDOp(inOffsetStmt, Var202, dcMload)),
+    Variable_Value(Var202, "0x20"),
+    Statement_Defines(dcMloadStmt, dcMload, _),
+    Statement_Opcode(dcMloadStmt, "MLOAD"),
+    MLOADOp(dcMloadStmt, Var403),
+    Variable_Value(Var403, "0x40")).
+
+  .decl Rule4(jumpiStmt: Statement, sucVar: Variable)
+  .output Rule4 
+  Rule4(jumpiStmt, sucVar) :-
+    // Step 1: get all the jumpi and its conditional variable 
+    JUMPIOp(jumpiStmt, _, jumpiVar),
+    // Step 2: check whether the conditional variable depends on the returned value from delegatecall
+    depends(jumpiVar, sucVar).
+
+  // b1 is the targetBlock, b2 is the parent block?
+  .decl successorBlock(b1:Block, b2:Block)
+  successorBlock(b1, b2) :-
+    In_LocalBlockEdge(b2, b1).
+
+  successorBlock(b1, b2) :-
+    successorBlock(b2, b),
+    successorBlock(b, b1).
+
+  // new rule5: relax to remove false negatives
+  .decl Rule51(jumpiStmt: Statement, stmt1Block: Block)
+  .output Rule51
+  Rule51(jumpiStmt, stmt1Block) :-
+    // get the jumpi block
+    Statement_Block(jumpiStmt, jumpiBlock),
+  
+    // stop/return in one block 
+    (Statement_Opcode(stmt1, "STOP"); Statement_Opcode(stmt1, "RETURN")),
+    Statement_Block(stmt1, stmt1Block),
+    successorBlock(stmt1Block, jumpiBlock).
+
+
+  // new rule5: make it more reasonable
+  .decl Rule52(jumpiStmt: Statement, stmt2Block: Block)
+  .output Rule52 
+  Rule52(jumpiStmt, stmt2Block) :-
+    // get the jumpi block
+    Statement_Block(jumpiStmt, jumpiBlock),
+  
+    // throw/revert in another block 
+    (Statement_Opcode(stmt2, "REVERT"); Statement_Opcode(stmt2, "THROW")),
+    Statement_Block(stmt2, stmt2Block),
+    successorBlock(stmt2Block, jumpiBlock).
+
+
+// general version of detecting proxy: upgradable or not
+  .decl Proxy(func: Function, funcName: symbol, callStmt: Statement, calleeVar: Variable,
+              cdcStmt: Statement, 
+              jumpiStmt: Statement, sucVar: Variable, 
+              setterFuncName: symbol,
+              block1: Block, block2: Block,
+              calleeOp: Opcode) 
+  .output Proxy
+  Proxy(func, funcName, callStmt, calleeVar, 
+        cdcStmt, 
+        jumpiStmt, sucVar, 
+        setterFuncName,
+        block1, block2,
+        calleeOp) :- 
+    Rule1(func, funcName, callStmt, calleeVar, inOffsetVar, inSizeVar, _, sucVar),
+    (Rule2(calleeVar, setterFuncName); Rule22(calleeVar, setterFuncName)), Statement_Defines(calleeStmt, calleeVar, 0), Statement_Opcode(calleeStmt, calleeOp),
+    
+    // upgradable: only upgradable
+    // Rule2(calleeVar, setterFuncName), Statement_Defines(calleeStmt, calleeVar, 0), Statement_Opcode(calleeStmt, calleeOp),
+
+    Rule3(cdcStmt, inOffsetVar, inSizeVar, func),
+    Rule4(jumpiStmt, sucVar),
+    Rule51(jumpiStmt, block1), Rule52(jumpiStmt, block2), block1 != block2.
+
+    // Mia add end
+}
+
+/**
+  Inliner was designed as a component in order to be able to have
+  sub-components with different inline candidate criteria and also
+  be able to perform multiple rounds of inlining on a single run,
+  avoiding redundant IO costs.
+
+  To achieve the latter, the inliners should be self-contained.
+  Implementing an AnalysisHelpInliner without using anything from
+  the memory modeling would have to be based on weak heuristics so
+  I (SL) decided to use them. Perhaps revisit if their use is proved
+  to be too costly.
+**/
+
+.comp AnalysisHelpInliner : FunctionInliner {
+
+  .override InlineCandidate
+  //.output InlineCandidate
+
+  /* Inline guards to help our analysis */
+  InlineCandidate(fun):-
+    (In_Statement_Opcode(callerOp, "CALLER"); In_Statement_Opcode(callerOp, "ORIGIN")),
+    In_Statement_Defines(callerOp, sender, 0),
+    LocalFlows(sender, formalRet),
+    In_FormalReturnArgs(fun, formalRet, _).
+
+  /* To detect some storage constructs breaking through functions */
+  InlineCandidate(fun):-
+    (SHA3(_, _, _, var) ; Variable_Value(var, _)),
+    LocalFlows(var, actualArg),
+    In_ActualArgs(caller, actualArg, pos),
+    In_CallGraphEdge(caller, fun),
+    In_FormalArgs(fun, formalArg, pos),
+    LocalFlows(formalArg, storeIndex),
+    (SLOAD(_, storeIndex, _) ; SSTORE(_, storeIndex, _)).
+
+  InlineCandidate(fun):-
+    //In_Variable_Value(actualArg, _),
+    //In_ActualArgs(caller, actualArg, pos),
+    //In_CallGraphEdge(caller, fun),
+    In_FormalArgs(fun, formalArg, _),
+    LocalFlows(formalArg, calldataIndex),
+    CALLDATALOAD(_, calldataIndex, _).
+
+  // Functions that only have a return jump and no actual returns
+  InlineCandidate(fun):-
+    In_CallGraphEdge(_, fun),
+    numOfStatements = count : In_Statement_Function(_, fun),
+    numOfStatements = 1,
+    !In_FormalReturnArgs(fun, _, 0).
+
+  // Less than 3 blocks
+  InlineCandidate(fun):-
+    In_CallGraphEdge(_, fun),
+    In_FormalArgs(fun, _, _),
+    numOfBlocks = count : In_InFunction(_, fun),
+    numOfBlocks <= 3.
+
+  InlineCandidate(fun):-
+    In_IsFunction(fun),
+    1 = count : In_CallGraphEdge(_, fun),
+    !IsPublicFunction(fun).
+
+  InlineCandidate(fun):-
+    StatementConsumesMemoryNoArgs(memConsStmt),
+    In_Statement_Function(memConsStmt, fun).
+
+  InlineCandidate(fun):-
+    In_FormalArgs(fun, formalArg, _),
+    LocalFlows(formalArg, loadAddr),
+    MLOAD(_, loadAddr, loaded),
+    ( LocalFlows(loaded, formalRet);
+      LocalFlows(formalArg, formalRet)),
+    In_FormalReturnArgs(fun, formalRet, _),
+    !VarIsArray(formalArg, _).
+
+  InlineCandidate(fun):-
+    MLOADFreePtr_To(_, loadedAddr),
+    In_FormalReturnArgs(fun, loadedAddr, _),
+    !VarIsArray(loadedAddr, _).
+
+  InlineCandidate(fun):-
+    In_FormalArgs(fun, formalArg, _),
+    LocalFlows(formalArg, storeAddr),
+    MSTORE(_, storeAddr, _),
+    !VarIsArray(formalArg, _).
+
+  .decl FunctionContainsExternalCall(fun:Function)
+
+  FunctionContainsExternalCall(fun):-
+    (In_Statement_Opcode(callStmt, "CALL"); In_Statement_Opcode(callStmt, "STATICCALL"); In_Statement_Opcode(callStmt, "DELEGATECALL")),
+    In_Statement_Function(callStmt, fun).
+
+  InlineCandidate(fun):-
+    (In_Statement_Opcode(returnDataStmt, "RETURNDATASIZE"); In_Statement_Opcode(returnDataStmt, "RETURNDATACOPY")),
+    In_Statement_Function(returnDataStmt, fun),
+    !FunctionContainsExternalCall(fun).
+
+  .decl FunctionContainsMemConsStmt(fun:Function)
+
+  FunctionContainsMemConsStmt(fun):-
+    StatementUsesMemory(stmt,_),
+    In_Statement_Function(stmt, fun).
+
+  InlineCandidate(fun):-
+    MemoryCopyLoop(memLoop, _, _),
+    In_InFunction(memLoop, fun),
+    !FunctionContainsMemConsStmt(fun).
+}
+
+.init inliner = AnalysisHelpInliner
+
+.decl NeedsMoreInlining(fun:Function)
+.output NeedsMoreInlining
+
+NeedsMoreInlining(fun):-
+  inliner.InlineCandidate(fun),
+  inliner.SafelyInlinableFunction(fun),
+  !inliner.FunctionToInline(fun),
+  !IsPublicFunction(fun).
+
+inliner.In_Statement_Opcode(stmt, op):- Statement_Opcode(stmt, op).
+inliner.In_IsStatement(stmt):-IsStatement(stmt).
+inliner.In_Statement_Block(stmt, block):-Statement_Block(stmt, block).
+inliner.In_Variable_Value(var, value):-Variable_Value(var, value).
+inliner.In_Variable_BlockValue(var, value):-Variable_BlockValue(var, value).
+inliner.In_LocalBlockEdge(block, nextBlock):-LocalBlockEdge(block, nextBlock).
+inliner.In_FallthroughEdge(block, nextBlock):- FallthroughEdge(block, nextBlock).
+inliner.In_CallGraphEdge(block, function):- CallGraphEdge(block, function).
+inliner.In_FunctionCallReturn(block, function, return):- FunctionCallReturn(block, function, return).
+inliner.In_IsFunction(func):- IsFunction(func).
+inliner.In_Block_Gas(block, gas):- Block_Gas(block, gas).
+inliner.In_Block_CodeChunkAccessed(block, chunk):- Block_CodeChunkAccessed(block, chunk).
+inliner.In_Statement_OriginalStatement(stmt, original):- Statement_OriginalStatement(stmt, original).
+inliner.In_Statement_OriginalStatementList(stmt, original):- Statement_OriginalStatementList(stmt, original).
+inliner.In_OriginalStatement_Block(stmt, block):- OriginalStatement_Block(stmt, block).
+inliner.In_FormalArgs(fn, a, pos):- FormalArgs(fn, a, pos).
+inliner.In_Statement_Uses(stmt, var, i):- Statement_Uses(stmt, var, i).
+inliner.In_Statement_Defines(stmt, var, n):- Statement_Defines(stmt, var, n).
+inliner.In_Statement_Next(stmt, next):- Statement_Next(stmt, next).
+inliner.In_FunctionEntry(block):- FunctionEntry(block).
+inliner.In_InFunction(block, function):- InFunction(block, function).
+inliner.In_ActualReturnArgs(caller, arg, pos):- ActualReturnArgs(caller, arg, pos).
+
+
+
+.output inliner.Out_Statement_Opcode(IO="file", filename = "TAC_Op.csv", delimiter = "\t")
+.output inliner.Out_IsStatement(IO="file", filename="TAC_Stmt.csv", delimiter="\t")
+.output inliner.Out_Statement_Block(IO="file", filename="TAC_Block.csv", delimiter="\t")
+.output inliner.Out_Variable_Value(IO="file", filename="TAC_Variable_Value.csv", delimiter="\t")
+.output inliner.Out_Variable_BlockValue(IO="file", filename="TAC_Variable_BlockValue.csv", delimiter="\t")
+.output inliner.Out_LocalBlockEdge(IO="file", filename="LocalBlockEdge.csv", delimiter="\t")
+.output inliner.Out_FallthroughEdge(IO="file", filename="IRFallthroughEdge.csv", delimiter="\t")
+.output inliner.Out_CallGraphEdge(IO="file", filename="IRFunctionCall.csv", delimiter="\t")
+.output inliner.Out_FunctionCallReturn(IO="file", filename="IRFunctionCallReturn.csv", delimiter="\t")
+.output inliner.Out_IsFunction(IO="file", filename="Function.csv", delimiter="\t")
+.output inliner.Out_Block_Gas(IO="file", filename="TAC_Block_Gas.csv", delimiter="\t")
+.output inliner.Out_Block_CodeChunkAccessed(IO="file", filename="TAC_Block_CodeChunkAccessed.csv", delimiter="\t")
+.output inliner.Out_Statement_OriginalStatement(IO="file", filename="TAC_Statement_OriginalStatement.csv", delimiter="\t")
+.output inliner.Out_Statement_OriginalStatementList(IO="file", filename="TAC_Statement_OriginalStatementList.csv", delimiter="\t")
+.output inliner.Out_OriginalStatement_Block(IO="file", filename="TAC_OriginalStatement_Block.csv", delimiter="\t")
+.output inliner.Out_FormalArgs(IO="file", filename="FormalArgs.csv", delimiter="\t")
+.output inliner.Out_Statement_Uses(IO="file", filename="TAC_Use.csv", delimiter="\t")
+.output inliner.Out_Statement_Defines(IO="file", filename="TAC_Def.csv", delimiter="\t")
+.output inliner.Out_Statement_Next(IO="file", filename="TAC_Statement_Next.csv", delimiter="\t")
+.output inliner.Out_FunctionEntry(IO="file", filename="IRFunctionEntry.csv", delimiter="\t")
+.output inliner.Out_InFunction(IO="file", filename="InFunction.csv", delimiter="\t")
+.output inliner.Out_ActualReturnArgs(IO="file", filename="ActualReturnArgs.csv", delimiter="\t")

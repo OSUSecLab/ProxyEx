@@ -1,0 +1,9 @@
+[reth]
+datadir = "/mnt/nvme/mengya/reth-node/reth-data"
+
+[proxyex-detector]
+database_url = "postgres://localhost:15432/proxyex-detector"
+
+[log]
+console_level = "info"
+file_level = "info"
